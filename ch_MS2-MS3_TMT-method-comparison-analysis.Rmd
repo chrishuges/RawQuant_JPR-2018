@@ -1,0 +1,459 @@
+---
+title: "Analysis of TMT data from MS2 and MS3 methods"
+author: "Christopher Hughes"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE)
+```
+
+###Description
+
+This file contains the code for processing the search and quantification output files from the analysis of MS2 and MS3 methods for the acquisition of TMT samples. **These data were used to make portions of Figure 3, 4, S-8.**
+
+  * MGF files were generated using RawQuant.
+  * The data were searched using SearchCLI and PeptideShakerCLI.
+  * Raw files were quantified with RawQuant.
+  
+###Analysis
+
+These are the libraries we will use somewhere in the analysis.
+
+```{r, message=FALSE}
+library(Biostrings)
+library(dplyr)
+library(ggplot2)
+library(RColorBrewer)
+library(cowplot)
+library(reshape)
+library(data.table)
+library(limma)
+```
+
+First we can look at the actual scan metrics. How do the numbers of MS2 change across the acquisition types and numbers of injections?
+
+```{r}
+#first grab the MS2 output files from RawQuant for each analysis type
+ms2_quant_files = list.files('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/quant-output',pattern='*MS2ParseData.txt',full.names=TRUE)
+
+ms2_data = data.frame() #data storage object 
+#iterate over the quantification files to get the numbers of MS2 scans
+for (i in 1:length(ms2_quant_files)){
+  ms2_in = read.table(ms2_quant_files[i],header=TRUE,sep='\t') #read in the file
+  ms2_in$fraction = sub(".*?TMT6_(.*?)_[1-9].*", "\\1", ms2_quant_files[i]) #add a fraction column
+  ms2_data = rbind(ms2_data,ms2_in) #bind the data
+}
+saveRDS(ms2_data,'/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/all-fractions-ms2-data.rds') #save the data
+msms_table = as.data.frame(table(ms2_data$fraction)) #summarise the data to count the MS2 in each fraction
+#plot the data
+msms_plot = ggplot(msms_table, aes(x = Var1, y = Freq)) +
+  geom_point(colour='grey60',size=2) +
+  labs(x = "fraction", y = 'number of msms', title = 'msms acquisition across fractions') +
+  theme(axis.text.x = element_text(size = 9)) +
+  geom_hline(yintercept=mean(msms_table$Freq,na.rm=TRUE),color = brewer.pal(6,'RdBu')[1])
+  #scale_y_continuous(breaks = seq(0,65000,5000),limits=c(40000,65000)) +
+  #scale_x_continuous(breaks = seq(1,15,1))
+msms_plot #call the plot
+save_plot('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/number-of-ms2-scans-across-all-methods.pdf',msms_plot) #save the plot
+message('mean number of msms = ',mean(msms_table$Freq,na.rm=TRUE))
+```
+
+Now we want to calculate what this does to the number of unique peptide matches. Need to read the identification data for this. The below code builds two large data matrices that contain all the ms2 quant and identification data, and another for the ms3 data. The data matrices are saved for later use. 
+
+```{r}
+####make a database index for adding annotation data later to the identification data
+humanDB = readAAStringSet('/projects/ptx_analysis/chughes/databases/uniprot_human-crap-oct2017-FWD.fasta')
+#make an annotation index from humanDB
+humanIndex = data.frame('meta' = names(humanDB))
+humanIndex$accession = sub(".*?\\|(.*?)\\|.*", "\\1", humanIndex$meta) #grab the accession
+humanIndex$gene = sub(".*?GN=(.*?) .*", "\\1", humanIndex$meta) #grab the gene name
+humanIndex$species = sub(".*?OS=(.*?) [GP].*", "\\1", humanIndex$meta) #grab the species
+humanIndex = humanIndex[,2:4] #grab the important data
+
+###iterate over the identification and quantification data to build a single massive id + quant object
+###quant fies for ms2 files
+ms2_quant_files = list.files('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/quant-output', pattern='.*fusion-ms2.*QuantData.txt',full.names=TRUE) #quant data from RawQuant
+ms2_quant_data = data.frame() #data storage object
+#iterate over the quant files
+for (i in 1:length(ms2_quant_files)){
+  quant_in = read.table(ms2_quant_files[i],header=TRUE,sep='\t') #grab the input file
+  #change values that are zero to NA
+  quant_in[,9:44][quant_in[,9:44] == 0] = NA
+  #rearrange the data frame
+  quant_meta = quant_in[,c('PrecursorMass','ScanNumber','MS1ScanNumber','RetentionTime',
+                           'PrecursorCharge','MS2IonInjectionTime','MS1Interference')]
+  quant_exprs = quant_in[,c('tmt126_intensity','tmt127N_intensity','tmt128C_intensity','tmt129N_intensity',
+                            'tmt130C_intensity','tmt131_intensity','tmt126_noise','tmt127N_noise',
+                            'tmt128C_noise','tmt129N_noise','tmt130C_noise','tmt131_noise')]
+  #calculate signal to noise
+  quant_sn = quant_exprs[,c(1:6)] / quant_exprs[,c(7:12)] #signal-to-noise calculation
+  quant_sn$totalIntensity = rowSums(quant_exprs[,1:6],na.rm=TRUE) #total intensity calculation
+  quant_sn$totalSN = rowSums(quant_sn[,1:6],na.rm=TRUE) #total signal-to-noise calculation
+  quant_sn$totalNoise = rowSums(quant_exprs[,7:12],na.rm=TRUE) #total noise calculation
+  quant_sn$totalNA = rowSums(is.na(quant_sn[,1:6])) #information about missing values
+  quant_meta$fraction = sub(".*?ms2_(.*?)_Quant.*", "\\1", ms2_quant_files[i]) #add the fraction column
+  quant_meta$replicate = sub(".*?TMT6_(.*?)_[1-9].*", "\\1", ms2_quant_files[i]) #add a replicate column
+  quant_matrix = cbind(quant_meta,quant_sn) #bind the information and quantification together
+  ms2_quant_data = rbind(ms2_quant_data, quant_matrix) #bind into a single frame
+}
+
+###MS2 identification results
+ms2_psm_files = list.files('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/reports-output', pattern='ms2.*Default_PSM_Report.txt',full.names=TRUE)
+ms2_psm_data = data.frame() #data storage object
+for (i in 1:length(ms2_psm_files)){
+###this first section handles the identification data
+  psm_in = read.table(ms2_psm_files[i],header=TRUE,sep='\t') #input file
+  psm_f1 = psm_in %>% 
+    dplyr::select(Protein.s., Sequence, Spectrum.File, Spectrum.Title, m.z, Identification.Charge) %>% #select columns
+    dplyr::mutate(Spectrum.Title, scan_num = sub(".*?spectrum (.*?)", "\\1", Spectrum.Title)) %>% #parse out the scan number
+    dplyr::mutate(Identification.Charge, id_charge = gsub("[^0-9]", "", Identification.Charge)) %>% #parse out the charge
+    dplyr::mutate(Spectrum.Title, fraction = sub(".*?ms2_(.*?)_MGF.*", "\\1", Spectrum.File)) %>% #parse the fraction
+    dplyr::mutate(Spectrum.Title, replicate = sub(".*?TMT6_(.*?)_[1-9].*", "\\1", Spectrum.File)) %>% #parse the fraction
+    dplyr::select(Protein.s., Sequence, scan_num, m.z, id_charge, fraction, replicate) %>% #select new columns
+    dplyr::mutate(Protein.s., first_accession = sapply(strsplit(as.character(Protein.s.),"\\,"), `[`, 1)) #parse the accession
+  #adjust the column names
+  colnames(psm_f1) = c('accession_groups','sequence','ScanNumber','id_precursor_mz','id_charge','fraction','replicate','accession')
+  psm_f2 = merge(psm_f1,humanIndex,by='accession',all.x=TRUE) #add the descriptive data
+  psm_f3 = dplyr::filter(psm_f2, !grepl('CONT', accession)) #remove contaminant hits
+  ms2_psm_data = rbind(ms2_psm_data,psm_f3)
+}
+ms2_idset = merge(ms2_psm_data,ms2_quant_data,by=c('ScanNumber','replicate','fraction'))
+saveRDS(ms2_idset,'/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/all-ms2-id-quant-data.rds')
+
+###quant fies for ms3 files
+ms3_quant_files = list.files('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/quant-output', pattern='.*fusion-ms3.*QuantData.txt',full.names=TRUE) #quant data from RawQuant
+ms3_quant_data = data.frame() #data storage object
+#iterate over the quant files
+for (i in 1:length(ms3_quant_files)){
+  quant_in = read.table(ms3_quant_files[i],header=TRUE,sep='\t') #grab the input file
+  #change values that are zero to NA
+  quant_in[,11:66][quant_in[,11:66] == 0] = NA
+  #rearrange the data frame
+  quant_meta = quant_in[,c('PrecursorMass','MS2ScanNumber','MS1ScanNumber','RetentionTime',
+                           'PrecursorCharge','MS2IonInjectionTime','MS1Interference')]
+  quant_exprs = quant_in[,c('tmt126_intensity','tmt127N_intensity','tmt128C_intensity','tmt129N_intensity',
+                            'tmt130C_intensity','tmt131_intensity','tmt126_noise','tmt127N_noise',
+                            'tmt128C_noise','tmt129N_noise','tmt130C_noise','tmt131_noise')]
+  #calculate signal to noise
+  quant_sn = quant_exprs[,c(1:6)] / quant_exprs[,c(7:12)] #signal-to-noise calculation
+  quant_sn$totalIntensity = rowSums(quant_exprs[,1:6],na.rm=TRUE) #total intensity calculation
+  quant_sn$totalSN = rowSums(quant_sn[,1:6],na.rm=TRUE) #total signal-to-noise calculation
+  quant_sn$totalNoise = rowSums(quant_exprs[,7:12],na.rm=TRUE) #total noise calculation
+  quant_sn$totalNA = rowSums(is.na(quant_sn[,1:6])) #information about missing values
+  quant_meta$fraction = sub(".*?ms3_(.*?)_Quant.*", "\\1", ms3_quant_files[i]) #add the fraction column
+  quant_meta$replicate = sub(".*?TMT6_(.*?)_[1-9].*", "\\1", ms3_quant_files[i]) #add a replicate column
+  quant_matrix = cbind(quant_meta,quant_sn) #bind the information and quantification together
+  ms3_quant_data = rbind(ms3_quant_data, quant_matrix) #bind into a single frame
+}
+colnames(ms3_quant_data)[2] = 'ScanNumber' #change the scan number identification column name
+
+###MS3 identification results
+ms3_psm_files = list.files('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/reports-output', pattern='ms3.*Default_PSM_Report.txt',full.names=TRUE)
+ms3_psm_data = data.frame() #data storage object
+for (i in 1:length(ms3_psm_files)){
+###this first section handles the identification data
+  psm_in = read.table(ms3_psm_files[i],header=TRUE,sep='\t') #input file
+  psm_f1 = psm_in %>% 
+    dplyr::select(Protein.s., Sequence, Spectrum.File, Spectrum.Title, m.z, Identification.Charge) %>% #select columns
+    dplyr::mutate(Spectrum.Title, scan_num = sub(".*?spectrum (.*?)", "\\1", Spectrum.Title)) %>% #parse out the scan number
+    dplyr::mutate(Identification.Charge, id_charge = gsub("[^0-9]", "", Identification.Charge)) %>% #parse out the charge
+    dplyr::mutate(Spectrum.Title, fraction = sub(".*?ms3_(.*?)_MGF.*", "\\1", Spectrum.File)) %>% #parse the fraction
+    dplyr::mutate(Spectrum.Title, replicate = sub(".*?TMT6_(.*?)_[1-9].*", "\\1", Spectrum.File)) %>% #parse the fraction
+    dplyr::select(Protein.s., Sequence, scan_num, m.z, id_charge, fraction, replicate) %>% #select new columns
+    dplyr::mutate(Protein.s., first_accession = sapply(strsplit(as.character(Protein.s.),"\\,"), `[`, 1)) #parse the accession
+  #adjust the column names
+  colnames(psm_f1) = c('accession_groups','sequence','ScanNumber','id_precursor_mz','id_charge','fraction','replicate','accession')
+  psm_f2 = merge(psm_f1,humanIndex,by='accession',all.x=TRUE) #add the descriptive data
+  psm_f3 = dplyr::filter(psm_f2, !grepl('CONT', accession)) #remove contaminant hits
+  ms3_psm_data = rbind(ms3_psm_data,psm_f3)
+}
+ms3_idset = merge(ms3_psm_data,ms3_quant_data,by=c('ScanNumber','replicate','fraction'))
+saveRDS(ms3_idset,'/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/all-ms3-id-quant-data.rds')
+```
+
+Now we can look at the impact of the ms2 or ms3 scanning on the numbers of unique peptides that have reliable quantification.
+
+```{r}
+ms2_set = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/all-ms2-id-quant-data.rds') #grab the ms2 data
+ms3_set = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/all-ms3-id-quant-data.rds') #grab the ms3 data
+ms_set = rbind(ms2_set,ms3_set) #bind all of the data together
+#aggregate to unique peptides
+ms_agg <- setDT(ms_set)[, lapply(.SD,sum,na.rm=TRUE),by=.(sequence,fraction,replicate),.SDcols=c('totalSN')] #collapse by PSM
+setDF(ms_agg) # convert back to dataframe
+peps_table = as.data.frame(table(ms_agg$replicate)) #summarise the data to count the peps in each fraction
+#plot the data
+peps_plot = ggplot(peps_table, aes(x = Var1, y = Freq)) +
+  geom_point(colour='grey60',size=2) +
+  labs(x = "acquisition method", y = 'number of peptides', title = 'peptide acquisition across fractions') +
+  theme(axis.text.x = element_text(size = 9)) +
+  geom_hline(yintercept=mean(peps_table$Freq,na.rm=TRUE),color = brewer.pal(6,'RdBu')[1])
+peps_plot #call the plot
+save_plot('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/number-of-peptides-across-all-methods.pdf',peps_plot) #save the plot
+message('mean number of peptides = ',mean(peps_table$Freq,na.rm=TRUE))
+```
+
+The PSM rate seems to increase as the analysis time gets shorter whereas the MS2 rate remains unchanged. The answer to this maybe be in the numbers of PSMs being identified per peptide. I would expect this to increase for MS2, but remain constant for MS3. 
+
+```{r}
+ms2_set = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/all-ms2-id-quant-data.rds') #grab the ms2 data
+ms3_set = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/all-ms3-id-quant-data.rds') #grab the ms3 data
+ms_set = rbind(ms2_set,ms3_set) #bind all of the data together
+#so this is PSM data. Need to do two separate aggregations.
+ms_set$PSM = 1 #add a PSM counter
+ms_psm <- setDT(ms_set)[, lapply(.SD,sum,na.rm=TRUE),by=.(accession,sequence,replicate),.SDcols=c('PSM')] #collapse by PSM
+ms_psm_per <- ms_psm[, lapply(.SD,mean,na.rm=TRUE),by=.(replicate),.SDcols=c('PSM')] #collapse by method, taking the mean this time
+setDF(ms_psm_per) # convert back to dataframe
+ms_psm$PEPS = 1 #add a peptide counter
+ms_pro <- setDT(ms_psm)[, lapply(.SD,sum,na.rm=TRUE),by=.(accession,replicate),.SDcols=c('PEPS')] #collapse by peptide
+ms_pro_per <- ms_pro[, lapply(.SD,mean,na.rm=TRUE),by=.(replicate),.SDcols=c('PEPS')] #can also do peptides per protein
+setDF(ms_pro_per) # convert back to dataframe
+```
+
+Hmm...this doesn't seem to be the case, so it is more likely that MS2 is just sampling more stuff that just isn't identified. Runs out of good hits to capture. How do the methods do for identification of the synthetic peptides. 
+
+```{r}
+ms2_set = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/all-ms2-id-quant-data.rds') #grab the ms2 data
+ms3_set = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/all-ms3-id-quant-data.rds') #grab the ms3 data
+ms_set = rbind(ms2_set,ms3_set) #bind all of the data together
+speps = read.table('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/ch_31906-31907-32033_libraries.txt',header=TRUE,sep='\t') #grab the synthetic peptide libraries
+ms_set$PSM = 1 #add a PSM counter
+ms_peps <- setDT(ms_set)[, lapply(.SD,sum,na.rm=TRUE),by=.(accession,gene,sequence,replicate),.SDcols=c('PSM')] #collapse by PSM into a peptide set per method
+setDF(ms_peps) # convert back to dataframe
+ms_peps$standard = 'no' #add annotation to track the standard peptides
+ms_peps[(ms_peps$gene %in% speps$Gene) & (ms_peps$sequence %in% speps$Peptide),6] = 'yes' #find the synthetic peptide entries
+ms_speps = subset(ms_peps, ms_peps$standard == 'yes') #keep only the synthetic peptides
+speps_table = as.data.frame(table(ms_speps$replicate)) #calculate the numbers of synthetic peptides identified
+```
+
+Ok now we can look at the actual quantitative accuracy of the data. 
+
+```{r}
+ms2_set = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/all-ms2-id-quant-data.rds') #grab the ms2 data
+ms3_set = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/all-ms3-id-quant-data.rds') #grab the ms3 data
+ms_set = rbind(ms2_set,ms3_set) #bind all of the data together
+speps = read.table('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/ch_31906-31907-32033_libraries.txt',header=TRUE,sep='\t') #grab the synthetic peptide libraries
+ms_set$standard = 'no' #add annotation to track the standard peptides
+ms_set[(ms_set$gene %in% speps$Gene) & (ms_set$sequence %in% speps$Peptide),27] = 'yes' #find the synthetic peptide entries
+ms_speps = subset(ms_set, ms_set$standard == 'yes') #keep only the synthetic peptides
+colnames(speps)[1:2] = c('gene','sequence') #change the column names for merging
+speps_all = merge(ms_speps,speps,by=c('gene','sequence'),all.x=TRUE) #get the quantification data back
+speps_all_sub = subset(speps_all, (totalSN > 100) & (totalNA == 0)) #filter the data to remove low abundance and noisy hits
+speps_all_sub[,17:22] = apply(speps_all_sub[,17:22],2,function(x) (x/speps_all_sub$totalSN)*12) #transform the quantification...12 is used here because it is the sum of all the channels (e.g. 3:3:3:1:1:1)
+#calculate the variations from expected for the three libraries
+refA = c(1,1,1,3,3,3) #expected ratios for libary A
+refA_set = subset(speps_all_sub, Library == 'refA')
+for (i in 1:length(refA)){
+  refA_set[,i+16] = abs(refA_set[,i+16] - refA[i])
+}
+refA_set$errorSD = apply(refA_set[,17:22],1, sd ,na.rm=TRUE)
+refA_set$errorMEAN = rowMeans(refA_set[,17:22],na.rm=TRUE)
+refA_set$CV = (refA_set$errorSD / refA_set$errorMEAN) * 100
+#next library
+refB = c(3,1,3,1,3,1) #expected ratios for libary B
+refB_set = subset(speps_all_sub, Library == 'refB')
+for (i in 1:length(refB)){
+  refB_set[,i+16] = abs(refB_set[,i+16] - refB[i])
+}
+refB_set$errorSD = apply(refB_set[,17:22],1, sd ,na.rm=TRUE)
+refB_set$errorMEAN = rowMeans(refB_set[,17:22],na.rm=TRUE)
+refB_set$CV = (refB_set$errorSD / refB_set$errorMEAN) * 100
+#next library
+refC = c(3,3,3,1,1,1) #expected ratios for libary C
+refC_set = subset(speps_all_sub, Library == 'refC')
+for (i in 1:length(refC)){
+  refC_set[,i+16] = abs(refC_set[,i+16] - refC[i])
+}
+refC_set$errorSD = apply(refC_set[,17:22],1, sd ,na.rm=TRUE)
+refC_set$errorMEAN = rowMeans(refC_set[,17:22],na.rm=TRUE)
+refC_set$CV = (refC_set$errorSD / refC_set$errorMEAN) * 100
+
+syn_peps = rbind(refA_set,refB_set,refC_set) #bind all the data back together
+saveRDS(syn_peps,'/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/synthetic-peptide-quant-data.rds')
+```
+
+Now we can do some plotting of the data.
+
+```{r}
+peps = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/synthetic-peptide-quant-data.rds')
+#make the plot for CV
+cv_plot = ggplot(peps, aes(replicate,CV)) +
+ geom_boxplot(outlier.color = 'gray60',outlier.alpha=0.5) +
+  #geom_point(size=4,color='gray60',alpha=0.75) +
+  labs(x = "sample", y = 'CV', title = 'quantification CV') +
+  theme(axis.text.x = element_text(size = 9))
+cv_plot #call the plot
+save_plot('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/ch_synthetic-peptides-CV-all-methods.pdf',cv_plot) #output the plot
+```
+
+Interesting. The CV's are lower for the MS2 data. This is likely the result of the SD not differing between the two approaches, but the mean being larger in the MS2 data (greater error). We can plot that as well. 
+
+```{r}
+peps = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/synthetic-peptide-quant-data.rds')
+#make the plot for CV
+err_plot = ggplot(peps, aes(replicate,errorMEAN)) +
+ geom_boxplot(outlier.color = 'gray60',outlier.alpha=0.5) +
+  #geom_point(size=4,color='gray60',alpha=0.75) +
+  labs(x = "sample", y = 'mean error', title = 'absolute error') +
+  theme(axis.text.x = element_text(size = 9))
+err_plot #call the plot
+save_plot('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/ch_synthetic-peptides-error-all-methods.pdf',err_plot) #output the plot
+```
+
+Ok so the error is higher for MS2. Not unexpected. But, does this negatively impact our ability to pull out hits we know are varying (e.g. synthetic peptides)?
+
+```{r}
+ms2_set = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/all-ms2-id-quant-data.rds') #grab the ms2 data
+ms3_set = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/all-ms3-id-quant-data.rds') #grab the ms3 data
+ms_set = rbind(ms2_set,ms3_set) #bind all of the data together
+speps = read.table('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/ch_31906-31907-32033_libraries.txt',header=TRUE,sep='\t') #grab the synthetic peptide libraries
+colnames(speps)[1:2] = c('gene','sequence') #change the column names for merging
+ms_set$standard = 'no' #add annotation to track the standard peptides
+ms_set[(ms_set$gene %in% speps$gene) & (ms_set$sequence %in% speps$sequence),27] = 'yes' #find the synthetic peptide entries
+peps = merge(ms_set,speps,by=c('gene','sequence'),all.x=TRUE) #merge the data
+peps_sub = subset(peps, (totalSN > 100) & (totalNA == 0) & !is.na(peps$Library)) #filter the data to remove low abundance and noisy hits
+
+
+#iterate over the methods to do stats one at a time
+method_type = unique(peps_sub$replicate) #get a list of the methods for analysis
+speps_set = data.frame() #data storage object
+for (l in 1:length(method_type)){
+  work_set = subset(peps_sub, replicate == method_type[l])
+  #calculate differential expression using limma
+  #focus on library refA and refC, because these are the two opposites
+  peps_no_refC = work_set[!grepl('refB',work_set$Library), ]
+  eset = as.matrix(log2(peps_no_refC[,c(17:22)])) #log transform the expression data and transfer to a new object
+  design <- cbind(condA=c(1,1,1,0,0,0),condB=c(0,0,0,1,1,1)) #create the design matrix
+  fit <- lmFit(eset,design) #calculate the linear model of the expression values
+  cont.matrix <- makeContrasts(condAvscondB=condA-condB, levels=design) #create the contrasts matrix
+  fit2 <- contrasts.fit(fit, cont.matrix) #calculate the contrasts
+  fit2 <- eBayes(fit2) #empirical Bayes smoothing
+  logFC = fit2$coef #extract fold changes
+  pVal = fit2$p.value #extract p-values
+  p.adj = p.adjust(fit2$p.value, method="BH") #apply multiple testing correction to the p-values
+  #insert the data back into the original matrix
+  peps_no_refC$logFC <- logFC
+  peps_no_refC$p.value <- pVal
+  peps_no_refC$p.adj.value <- p.adj
+  peps_no_refC_ord = peps_no_refC[order(-peps_no_refC$logFC),] #reorder the matrix by fold change
+  refAB_set = subset(peps_no_refC_ord, standard == 'yes')
+
+  #focus on library refB
+  peps_no_refAB = work_set[!grepl('refA',work_set$Library) & !grepl('refC',work_set$Library), ]
+  eset = as.matrix(log2(peps_no_refAB[,c(17:22)])) #log transform the expression data and transfer to a new object
+  design <- cbind(condA=c(1,0,1,0,1,0),condB=c(0,1,0,1,0,1)) #create the design matrix
+  fit <- lmFit(eset,design) #calculate the linear model of the expression values
+  cont.matrix <- makeContrasts(condAvscondB=condA-condB, levels=design) #create the contrasts matrix
+  fit2 <- contrasts.fit(fit, cont.matrix) #calculate the contrasts
+  fit2 <- eBayes(fit2) #empirical Bayes smoothing
+  logFC = fit2$coef #extract fold changes
+  pVal = fit2$p.value #extract p-values
+  p.adj = p.adjust(fit2$p.value, method="BH") #apply multiple testing correction to the p-values
+  #insert the data back into the original matrix
+  peps_no_refAB$logFC <- logFC
+  peps_no_refAB$p.value <- pVal
+  peps_no_refAB$p.adj.value <- p.adj
+  peps_no_refAB_ord = peps_no_refAB[order(-peps_no_refAB$logFC),] #reorder the matrix by fold change
+  refC_set = subset(peps_no_refAB_ord, standard == 'yes') #keep only standard peptides
+  speps_set = rbind(speps_set,refAB_set,refC_set) #bind the data back together
+}
+saveRDS(speps_set,'/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/synthetic-peptide-stats-data.rds') #output the processed data
+```
+
+Now we can do some plotting of the data.
+
+```{r}
+peps = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/synthetic-peptide-stats-data.rds')
+#make the plot for CV
+sigi_plot = ggplot(peps, aes(replicate,-log10(p.adj.value))) +
+ #geom_boxplot(outlier.color = 'gray60',outlier.alpha=0.5) +
+  geom_point(aes(colour=Library),size=1,alpha=0.5,position=position_dodge(width=0.3)) +
+  labs(x = "sample", y = '-log10(adjusted-p-value)', title = 'signficance') +
+  theme(axis.text.x = element_text(size = 9)) +
+  geom_hline(yintercept= -log10(0.05),color = brewer.pal(6,'RdBu')[1]) +
+  scale_color_manual(values=brewer.pal(6,'Set2')[1:3])
+  #theme(legend.position="none")
+sigi_plot #call the plot
+save_plot('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/ch_synthetic-peptides-significance-all-methods.pdf',sigi_plot) #output the plot
+
+#calculate the proportions above and below the significant threshold
+method_type = unique(peps$replicate) #get a list of the methods for analysis
+for (i in 1:length(method_type)){
+  work_set = subset(peps, replicate == method_type[i])
+  message(method_type[i])
+  message(length(work_set$p.adj.value))
+  message(length(which(work_set$p.adj.value<0.05)))
+}
+```
+
+Do we get any significant hits from the regular HeLa peptides?
+
+```{r}
+ms2_set = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/all-ms2-id-quant-data.rds') #grab the ms2 data
+ms3_set = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/all-ms3-id-quant-data.rds') #grab the ms3 data
+ms_set = rbind(ms2_set,ms3_set) #bind all of the data together
+speps = read.table('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/ch_31906-31907-32033_libraries.txt',header=TRUE,sep='\t') #grab the synthetic peptide libraries
+colnames(speps)[1:2] = c('gene','sequence') #change the column names for merging
+ms_set$standard = 'no' #add annotation to track the standard peptides
+ms_set[(ms_set$gene %in% speps$gene) & (ms_set$sequence %in% speps$sequence),27] = 'yes' #find the synthetic peptide entries
+peps = merge(ms_set,speps,by=c('gene','sequence'),all.x=TRUE) #merge the data
+peps_sub = subset(peps, (totalSN > 100) & (totalNA == 0)) #filter the data to remove low abundance and noisy hits
+
+
+#iterate over the methods to do stats one at a time
+method_type = unique(peps_sub$replicate) #get a list of the methods for analysis
+speps_set = data.frame() #data storage object
+for (l in 1:length(method_type)){
+  work_set = subset(peps_sub, replicate == method_type[l])
+  #calculate differential expression using limma
+  peps_no_hela = work_set[grepl('no',work_set$standard), ]
+  eset = as.matrix(log2(peps_no_hela[,c(17:22)])) #log transform the expression data and transfer to a new object
+  design <- cbind(condA=c(1,1,1,0,0,0),condB=c(0,0,0,1,1,1)) #create the design matrix
+  fit <- lmFit(eset,design) #calculate the linear model of the expression values
+  cont.matrix <- makeContrasts(condAvscondB=condA-condB, levels=design) #create the contrasts matrix
+  fit2 <- contrasts.fit(fit, cont.matrix) #calculate the contrasts
+  fit2 <- eBayes(fit2) #empirical Bayes smoothing
+  logFC = fit2$coef #extract fold changes
+  pVal = fit2$p.value #extract p-values
+  p.adj = p.adjust(fit2$p.value, method="BH") #apply multiple testing correction to the p-values
+  #insert the data back into the original matrix
+  peps_no_hela$logFC <- logFC
+  peps_no_hela$p.value <- pVal
+  peps_no_hela$p.adj.value <- p.adj
+  hela_set = peps_no_hela[order(-peps_no_hela$logFC),] #reorder the matrix by fold change
+  speps_set = rbind(speps_set,hela_set) #bind the data back together
+}
+saveRDS(speps_set,'/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/hela-peptide-stats-data.rds') #output the processed data
+```
+
+Now we can do some plotting of the data.
+
+```{r}
+peps = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/hela-peptide-stats-data.rds')
+#make the plot for CV
+sigi_plot = ggplot(peps, aes(replicate,-log10(p.adj.value))) +
+ #geom_boxplot(outlier.color = 'gray60',outlier.alpha=0.5) +
+  geom_point(colour='grey60',size=1,alpha=0.5) +
+  labs(x = "sample", y = '-log10(adjusted-p-value)', title = 'signficance') +
+  theme(axis.text.x = element_text(size = 9)) +
+  geom_hline(yintercept= -log10(0.05),color = brewer.pal(6,'RdBu')[1])
+sigi_plot #call the plot
+save_plot('/projects/ptx_analysis/chughes/projects-current/raw-quant/ms2-ms3/Routput/ch_hela-peptides-significance-all-methods.pdf',sigi_plot) #output the plot
+
+#calculate the proportions above and below the significant threshold
+method_type = unique(peps$replicate) #get a list of the methods for analysis
+for (i in 1:length(method_type)){
+  work_set = subset(peps, replicate == method_type[i])
+  message(method_type[i])
+  message(length(work_set$p.adj.value))
+  message(length(which(work_set$p.adj.value<0.05)))
+}
+```
+
+Done.
+
+
+
+
+
+

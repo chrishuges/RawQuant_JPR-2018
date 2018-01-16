@@ -1,0 +1,250 @@
+---
+title: "Analysis of Q-ExactiveHF-X from Kelstrup *et al.*"
+author: "Christopher Hughes"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE)
+```
+
+###Description
+
+This file contains the code for processing the search and quantification output files from the HeLa in-depth proteome publication from Kelstrup *et al.* (PMID: 29183128). **These data were used to make portions of Figure S-1.**
+
+  * MGF files were generated using RawQuant.
+  * The data were searched using SearchCLI and PeptideShakerCLI.
+  * Raw files were parsed with RawQuant.
+  
+###Analysis
+
+These are the libraries we will use somewhere in the analysis.
+
+```{r, message=FALSE}
+library(Biostrings)
+library(dplyr)
+library(ggplot2)
+library(RColorBrewer)
+library(cowplot)
+library(reshape)
+library(data.table)
+```
+
+First we can look at the distribution of MS2 events to see how well the MS is operating. Let's focus on the 15K resolution data because this is most similar to the QE-HF data we analyzed before.
+
+```{r}
+#first grab the files that are output from RawQuant for each MS level
+ms2_quant_files = list.files('/projects/ptx_results/OtherDataSets/2017-Nov_Kelstrup-JPro/quant-output',pattern='.*15000.*MS2ParseData.txt',full.names=TRUE)
+
+#now look at the distribution of MS2 events
+ms2_data = data.frame() #data storage object 
+#iterate over the quantification files to get the numbers of MS2 scans
+for (i in 1:length(ms2_quant_files)){
+  ms2_in = read.table(ms2_quant_files[i],header=TRUE,sep='\t') #read in the file
+  ms2_in$fraction = sub(".*?15000_(.*?)_MS2ParseData.*", "\\1", ms2_quant_files[i]) #add a fraction column
+  ms2_data = rbind(ms2_data,ms2_in) #bind the data
+}
+ms2_data$fraction = as.numeric(ms2_data$fraction) #change the fraction number to a numeric value
+ms2_data = ms2_data[order(ms2_data$fraction),] #sort the data object by fraction
+saveRDS(ms2_data,'/projects/ptx_analysis/chughes/projects-current/raw-quant/parse-manuscript/Routput/kelstrup_all-fractions-ms2-data.rds') #save the data
+msms_table = as.data.frame(table(ms2_data$fraction)) #summarise the data to count the MS2 in each fraction
+msms_table$Var1 = as.numeric(msms_table$Var1) #change to a numeric value for plotting
+
+#plot the data
+msms_plot = ggplot(msms_table, aes(x = Var1, y = Freq)) +
+  geom_point(colour='grey60',size=2) +
+  labs(x = "fraction", y = 'number of msms', title = 'msms acquisition across fractions') +
+  theme(axis.text.x = element_text(size = 9)) +
+  geom_hline(yintercept=mean(msms_table$Freq,na.rm=TRUE),color = brewer.pal(6,'RdBu')[1]) +
+  scale_y_continuous(breaks = seq(0,30000,5000),limits=c(0,25000)) +
+  scale_x_continuous(breaks = seq(1,50,5))
+msms_plot #call the plot
+save_plot('/projects/ptx_analysis/chughes/projects-current/raw-quant/parse-manuscript/Routput/kelstrup-number-of-msms-46fractions.pdf',msms_plot) #save the plot
+message('mean number of msms = ',mean(msms_table$Freq,na.rm=TRUE))
+```
+
+The distribution looks good, minus the first couple of fractions. How does this translate to identifications? Let's build the identification object just as we did with the previous data.
+
+```{r, message=FALSE}
+####first we need to make an index of protein information from our search database that we will use to add meta data to our IDs
+humanDB = readAAStringSet('/projects/ptx_analysis/chughes/databases/uniprot_human-crap-oct2017-FWD.fasta')
+#make an annotation index from humanDB
+humanIndex = data.frame('meta' = names(humanDB))
+humanIndex$accession = sub(".*?\\|(.*?)\\|.*", "\\1", humanIndex$meta) #grab the accession from the header
+humanIndex$gene = sub(".*?GN=(.*?) .*", "\\1", humanIndex$meta) #grab the gene from the header
+humanIndex$species = sub(".*?OS=(.*?) [GP].*", "\\1", humanIndex$meta) #grab the species from the header
+humanIndex = humanIndex[,2:4] #keep the important columns
+
+psm_files = list.files('/projects/ptx_results/OtherDataSets/2017-Nov_Kelstrup-JPro/reports-output',pattern='.*15000.*zip_1_Default_PSM_Report.txt',full.names=TRUE) #locate the desired files
+psms_data = data.frame() #make a data storage object
+#for this we need the identifications data
+for (i in 1:length(psm_files)){
+  psm_in = read.table(psm_files[i],header=TRUE,sep='\t')
+  psm_f1 = psm_in %>% 
+    dplyr::select(Protein.s., Sequence, Spectrum.File, Spectrum.Title, m.z, Identification.Charge) %>% #select columns
+    dplyr::mutate(Spectrum.Title, scan_num = sub(".*?spectrum (.*?)", "\\1", Spectrum.Title)) %>% #parse out the scan number
+    dplyr::mutate(Identification.Charge, id_charge = gsub("[^0-9]", "", Identification.Charge)) %>% #parse out the charge
+    dplyr::mutate(Spectrum.Title, fraction = sub(".*?15000_(.*?)_MGF\\.mgf", "\\1", Spectrum.File)) %>% #parse the fraction
+    dplyr::select(Protein.s., Sequence, scan_num, m.z, id_charge, fraction) %>% #select new columns
+    dplyr::mutate(Protein.s., first_accession = sapply(strsplit(as.character(Protein.s.),"\\,"), `[`, 1)) #parse the accession
+  #adjust the column names
+  colnames(psm_f1) = c('accession_groups','sequence','MS2ScanNumber','id_precursor_mz','id_charge','fraction','accession')
+  psm_f2 = merge(psm_f1,humanIndex,by='accession',all.x=TRUE) #add the descriptive data
+  psm_f3 = dplyr::filter(psm_f2, !grepl('CONT', accession)) #remove contaminant hits
+  #output to the data storage object
+  psms_data = rbind(psms_data,psm_f3)
+  #output message
+  message(i,' files completed')
+}
+saveRDS(psms_data,'/projects/ptx_analysis/chughes/projects-current/raw-quant/parse-manuscript/Routput/kelstrup_46-individual-fractions-identification-data.rds') #save the data
+```
+
+First we can look at PSM identification rate across the fractions.
+
+```{r}
+psms = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/parse-manuscript/Routput/kelstrup_46-individual-fractions-identification-data.rds') #grab the psms data
+ms2_data = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/parse-manuscript/Routput/kelstrup_all-fractions-ms2-data.rds') #grab the ms2 data
+psms$fraction = as.numeric(psms$fraction)#change to numeric to get rid of the '0' on the front of some of the numbers
+scans_table = merge(as.data.frame(table(psms$fraction)),as.data.frame(table(ms2_data$fraction)),by='Var1') #make a set of tables
+colnames(scans_table) = c('fraction','psms','msms')
+scans_table$fraction = as.numeric(as.character(scans_table$fraction)) #convert fraction to numeric for sorting
+scans_table = scans_table[order(scans_table$fraction),] #order by fraction
+#make the plot
+psms_plot = ggplot(scans_table, aes(x = fraction, y = psms)) +
+  geom_point(stat='identity',colour='grey60',size=2) +
+  labs(x = "fraction", y = 'number of psms', title = 'psms rate across fractions') +
+  theme(axis.text.x = element_text(size = 9)) +
+  geom_hline(yintercept=40,color = brewer.pal(6,'RdBu')[1],linetype='dashed') +
+  geom_hline(yintercept=mean(scans_table$psms,na.rm=TRUE),color = brewer.pal(6,'RdBu')[1]) +
+  scale_y_continuous(breaks = seq(0,16000,2000),limits = c(500,16000)) +
+  scale_x_continuous(breaks = seq(1,50,5))
+psms_plot #call the plot
+save_plot('/projects/ptx_analysis/chughes/projects-current/raw-quant/parse-manuscript/Routput/kelstrup-psms-rate-46fractions.pdf',psms_plot) #save the plot
+message('Mean psms level across all fractions is ',mean(scans_table$psms,na.rm=TRUE),'.')
+```
+
+And the identification rate?
+
+```{r}
+psms = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/parse-manuscript/Routput/kelstrup_46-individual-fractions-identification-data.rds') #grab the psms data
+ms2_data = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/parse-manuscript/Routput/kelstrup_all-fractions-ms2-data.rds') #grab the ms2 data
+psms$fraction = as.numeric(psms$fraction)#change to numeric to get rid of the '0' on the front of some of the numbers
+scans_table = merge(as.data.frame(table(psms$fraction)),as.data.frame(table(ms2_data$fraction)),by='Var1') #make a set of tables
+colnames(scans_table) = c('fraction','psms','msms')
+scans_table$id_rate = (scans_table$psms / scans_table$msms) * 100 #calculate id rate
+scans_table$fraction = as.numeric(as.character(scans_table$fraction)) #convert fraction to numeric for sorting
+scans_table = scans_table[order(scans_table$fraction),] #order by fraction
+#make the plot
+scans_plot = ggplot(scans_table, aes(x = fraction, y = id_rate)) +
+  geom_point(stat='identity',colour='grey60',size=2) +
+  labs(x = "fraction", y = 'id rate (percent)', title = 'identification rate across fractions') +
+  theme(axis.text.x = element_text(size = 9)) +
+  geom_hline(yintercept=mean(scans_table$id_rate,na.rm=TRUE),color = brewer.pal(6,'RdBu')[1]) +
+  scale_y_continuous(breaks = seq(0,60,5),limits = c(5,60)) +
+  scale_x_continuous(breaks = seq(1,50,5))
+scans_plot #call the plot
+save_plot('/projects/ptx_analysis/chughes/projects-current/raw-quant/parse-manuscript/Routput/kelstrup-identification-rate-46fractions.pdf',scans_plot) #save the plot
+message('Mean identification rate across all fractions is ',mean(scans_table$id_rate,na.rm=TRUE),'.')
+```
+
+This seems much better. So I wonder how well the MS is cycling? Is it triggering many MS2 scans in each cycle? Hitting the topN?
+
+```{r}
+ms2_data = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/parse-manuscript/Routput/kelstrup_all-fractions-ms2-data.rds') #grab the ms2 data
+ms2_data$topN = 1 #add an extra column as a counter
+ms_agg <- setDT(ms2_data)[, lapply(.SD,sum,na.rm=TRUE),by=.(MS1ScanNumber,fraction),.SDcols=c('topN')] #collapse by MS1 scan
+setDF(ms_agg) # convert back to dataframe
+#make a table of the topN values across fractions
+topN_plot = ggplot(ms_agg, aes(fraction,topN,group=fraction)) +
+  geom_boxplot(outlier.color = 'gray60',outlier.alpha=0.5) +
+  labs(x = "fraction", y = 'topN', title = 'topN analysis across fractions') +
+  theme(axis.text.x = element_text(size = 9)) +
+  geom_hline(yintercept=mean(ms_agg$topN,na.rm=TRUE),color = brewer.pal(6,'RdBu')[1]) +
+  scale_x_continuous(breaks=seq(1,50,5))
+topN_plot #call the plot
+save_plot('/projects/ptx_analysis/chughes/projects-current/raw-quant/parse-manuscript/Routput/kelstrup-topN-rate-46fractions.pdf',topN_plot) #save the plot
+message('Mean topN across all fractions is ',mean(ms_agg$topN,na.rm=TRUE),'.')
+```
+
+So we are hitting the topN very frequently here...but it is a lower setting and the HF-X has APD to get more precursors...so perhaps we are not surprised. What is the overall scan rate based on MS/MS per second?
+
+```{r}
+ms2_data = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/parse-manuscript/Routput/kelstrup_all-fractions-ms2-data.rds') #grab the ms2 data
+ms2_sub = subset(ms2_data, (ms2_data$RetentionTime >= 3) & (ms2_data$RetentionTime < 20)) #subset the data across a specific rt range
+ms2_sub$seconds = ms2_sub$RetentionTime *60
+ms2_sub$bin_group = cut(ms2_sub$seconds, breaks = seq(180,1200,1))
+ms2_sub$numMS2 = 1 #add an MS2 counter
+ms2_agg <- setDT(ms2_sub)[, lapply(.SD,sum,na.rm=TRUE),by=.(bin_group,fraction),.SDcols='numMS2'] #collapse by the retention time bin
+ms2_agg_fraction <- ms2_agg[, lapply(.SD,mean,na.rm=TRUE),by=.(bin_group),.SDcols='numMS2'] #collapse by the fraction
+setDF(ms2_agg_fraction) # convert back to dataframe
+ms2_agg_ordered = ms2_agg_fraction[order(ms2_agg_fraction$bin_group),] #order the data by bins
+ms2_agg_ordered$bin_start = as.numeric(sub('\\((.*?)\\,.*','\\1',ms2_agg_ordered$bin_group)) #get the bin start point
+ms2_agg_ordered$bin_end = as.numeric(sub('.*\\,(.*?)\\].*','\\1',ms2_agg_ordered$bin_group)) #get the bin end point
+#now plot the data based on the bins
+Hz_scatter = ggplot(ms2_agg_ordered, aes(bin_end,numMS2)) +
+  geom_point(colour='gray60',alpha=0.5) +
+  labs(x = "retention time", y = 'msms per second', title = 'Hz analysis across all fractions') +
+  geom_hline(yintercept=mean(ms2_agg_ordered$numMS2),color = brewer.pal(6,'RdBu')[1]) +
+  scale_y_continuous(limits=c(0,25),breaks=seq(0,25,5)) +
+  scale_x_continuous(limits=c(0,1200),breaks=seq(0,1200,20))
+Hz_scatter #call the plot
+save_plot('/projects/ptx_analysis/chughes/projects-current/raw-quant/parse-manuscript/Routput/kelstrup-Hz-46fractions.pdf',Hz_scatter) #save the plot
+message('Mean number of MS/MS per second is ',mean(ms2_agg_ordered$numMS2,na.rm=TRUE),'.')
+```
+
+So looking very good. Still should look at individual duty cycles. What about the time between MS1 scans?
+
+```{r}
+ms1_quant_files = list.files('/projects/ptx_results/OtherDataSets/2017-Nov_Kelstrup-JPro/quant-output',pattern='.*15000.*MS1ParseData.txt',full.names=TRUE)#grab the MS1 RawQuant fies
+ms1_data = data.frame() #data storage object 
+#iterate over the quantification files to get the numbers of MS1 scans
+for (i in 1:length(ms1_quant_files)){
+  ms1_in = read.table(ms1_quant_files[i],header=TRUE,sep='\t') #read in the file
+  ms1_in$fraction = sub(".*?15000_(.*?)_MS1ParseData.*", "\\1", ms1_quant_files[i]) #add a fraction column
+  ms1_data = rbind(ms1_data,ms1_in) #bind the data
+}
+ms1_data$fraction = as.numeric(ms1_data$fraction) #change the fraction number to a numeric value
+ms1_data = ms1_data[order(ms1_data$fraction),] #sort the data object by fraction
+saveRDS(ms1_data,'/projects/ptx_analysis/chughes/projects-current/raw-quant/parse-manuscript/Routput/kelstrup_all-fractions-ms1-data.rds') #save the data
+
+#iterate through the fractions and get the between MS2 scan differences
+rt_diff = data.frame() #output storage
+for (i in 1:46){
+  frac_of_interest = subset(ms1_data, fraction == i) #get out the individual fraction
+  frac_diff = as.data.frame(diff(frac_of_interest$RetentionTime,1)) #calculate the differences
+  frac_diff$fraction = i #add the fraction column back
+  colnames(frac_diff)[1] = 'difference' #change column names for the difference values
+  frac_diff$seconds = frac_diff$difference*60
+  rt_diff = rbind(rt_diff,frac_diff) #bind the data for output
+}
+#make plot of the data
+rt_diff_plot = ggplot(rt_diff, aes(fraction,log2(seconds),group=fraction)) +
+  geom_boxplot(outlier.color = 'gray60',outlier.alpha=0.5) +
+  labs(x = "fraction", y = 'ms1 time difference (sec)', title = 'Scan Lag Times') +
+  theme(axis.text.x = element_text(size = 9)) +
+  geom_hline(yintercept=log2(3.64),color = brewer.pal(6,'RdBu')[1]) +
+  geom_hline(yintercept=log2(6.2),color = brewer.pal(6,'RdBu')[1]) +
+  scale_x_continuous(breaks=seq(1,50,5))
+rt_diff_plot #call the plot
+save_plot('/projects/ptx_analysis/chughes/projects-current/raw-quant/parse-manuscript/Routput/kelstrup-rt-difference-46fractions.pdf',rt_diff_plot) #save the plot
+message('Mean between MS2 scan difference across all fractions is ',mean(rt_diff$seconds,na.rm=TRUE),' seconds.')
+message('Median between MS2 scan difference across all fractions is ',median(rt_diff$seconds,na.rm=TRUE),' seconds.')
+```
+
+And lastly, how does all of this translate to metrics based on injection times?
+
+```{r}
+psms = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/parse-manuscript/Routput/kelstrup_46-individual-fractions-identification-data.rds') #grab the psms data
+ms2_data = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/parse-manuscript/Routput/kelstrup_all-fractions-ms2-data.rds') #grab the ms2 data
+colnames(psms)[4] = 'ScanNumber' #change a column name for merging
+id_data = merge(psms,ms2_data,by=c('ScanNumber','fraction'),all.x=TRUE) #merge the id and quant data
+#get the metrics values
+message('proportion of scans at max injection = ',length(which(ms2_data$MS2IonInjectionTime == 22)) / length(ms2_data$MS2IonInjectionTime)) #proportion of scans at max injection
+message('total number of ms2 = ',length(ms2_data$ScanNumber)) #total number of ms2
+message('number at max inject = ',length(which(ms2_data$MS2IonInjectionTime == 22))) #number at max inject
+message('number not at max inject = ',length(which(ms2_data$MS2IonInjectionTime != 22))) #number not at max inject
+message('number of psms at max inject = ',length(which(id_data$MS2IonInjectionTime == 22))) #number of psms at max inject
+message('number of psms not at max inject = ',length(which(id_data$MS2IonInjectionTime != 22))) #number of psms not at max inject
+```
+
+Done. 

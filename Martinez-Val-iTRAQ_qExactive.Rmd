@@ -1,0 +1,172 @@
+---
+title: "Analysis of Q-Exactive MS2 iTRAQ data from Martinez-Val *et al.*"
+author: "Christopher Hughes"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE)
+```
+
+###Description
+
+This file contains the code for processing the search and quantification output files from the iTRAQ proteome mixture publication from Martinez-Val *et al.* (PMID: 27452035). **These data were used to make Figure S-6.**
+
+  * MGF files were generated using RawQuant.
+  * The data were searched using SearchCLI and PeptideShakerCLI.
+  * Raw files were quantified with RawQuant and Proteome Discoverer in parallel.
+  
+###Analysis
+
+First call the required libraries.
+
+```{r, message=FALSE}
+library(Biostrings)
+library(dplyr)
+library(ggplot2)
+library(RColorBrewer)
+library(cowplot)
+library(reshape)
+```
+
+Next we want to make an index based on our search database that we can use to add descriptive data to our search result.
+
+```{r}
+####
+mixDB = readAAStringSet('/projects/ptx_analysis/chughes/databases/uniprot_human-ecoli-crap-oct2017-FWD.fasta')
+#make an annotation index from the human and e coli mixture database
+mixIndex = data.frame('meta' = names(mixDB))
+mixIndex$accession = sub(".*?\\|(.*?)\\|.*", "\\1", mixIndex$meta) #grab the accession from the header
+mixIndex$gene = sub(".*?GN=(.*?) .*", "\\1", mixIndex$meta) #grab the gene from the header
+mixIndex$species = sub(".*?OS=(.*?) [GP].*", "\\1", mixIndex$meta) #grab the species from the header
+mixIndex = mixIndex[,2:4]
+```
+
+Now we can go ahead and grab the identification and quantification data.
+
+```{r}
+#find the files of interest
+#psms files from SearchCLI and PeptideShaker
+psm_files = list.files('/projects/ptx_results/OtherDataSets/2016-July_Munoz_JPro/reports-output',pattern='*Default_PSM_Report.txt',full.names=TRUE)
+#quant files from RawQuant algorithm
+quant_files = list.files('/projects/ptx_results/OtherDataSets/2016-July_Munoz_JPro/quant-output',pattern='*QuantData.txt',full.names=TRUE)
+#quant files from Proteome Discoverer
+pd_files = list.files('/projects/ptx_results/OtherDataSets/2016-July_Munoz_JPro/pd-quant-output',pattern='*QuanSpectra.txt',full.names=TRUE)
+```
+
+Now we can process the peptide spectral match data to a more manageable data frame, and incorporate the quantification data from the two different sources.
+
+```{r, message=FALSE}
+psm_all = data.frame() #create an empty data frame to hold the output data
+#iterate over all the psm files
+for (i in 1:length(psm_files)){
+  
+  ###this first section handles the identification data
+  psm_in = read.table(psm_files[i],header=TRUE,sep='\t') #grab the input file
+  psm_f1 = psm_in %>% 
+    dplyr::select(Protein.s., Sequence, Spectrum.File, Spectrum.Title, m.z, Identification.Charge) %>% #select columns
+    dplyr::mutate(Spectrum.Title, scan_num = sub(".*?spectrum (.*?)", "\\1", Spectrum.Title)) %>% #parse out the scan number
+    dplyr::mutate(Identification.Charge, id_charge = gsub("[^0-9]", "", Identification.Charge)) %>% #parse out the charge
+    dplyr::mutate(Spectrum.Title, fraction = sub(".*?Isolationexp_(.*?)_.*", "\\1", Spectrum.File)) %>% #parse the fraction
+    dplyr::mutate(Spectrum.Title, replicate = sub(".*?Isolationexp_(.*?)_MGF\\.mgf", "\\1", Spectrum.File)) %>% #parse the replicate
+    dplyr::select(Protein.s., Sequence, scan_num, m.z, id_charge, fraction, replicate) %>% #select new columns
+    dplyr::mutate(Protein.s., first_accession = sapply(strsplit(as.character(Protein.s.),"\\,"), `[`, 1)) #parse the accession
+  #adjust the column names
+  colnames(psm_f1) = c('accession_groups','sequence','ScanNumber','id_precursor_mz','id_charge','fraction','replicate','accession')
+  psm_f2 = merge(psm_f1,mixIndex,by='accession',all.x=TRUE) #add the descriptive data
+  psm_f3 = dplyr::filter(psm_f2, !grepl('CONT', accession)) #remove contaminant hits
+  
+  
+  ####this second section handles the RawQuant quantification data
+  quant_in = read.table(quant_files[i],header=TRUE,sep='\t') #grab the input file
+  quant_in[,9:56][quant_in[,9:56] == 0] = NA #transform any zero or missing values to NA
+  quant_f1 = subset(quant_in, rowSums(is.na(quant_in[,c('iTRAQ113_intensity','iTRAQ114_intensity','iTRAQ115_intensity',
+                                                        'iTRAQ116_intensity','iTRAQ117_intensity','iTRAQ118_intensity',
+                                                        'iTRAQ119_intensity','iTRAQ121_intensity')])) < 8) #calculate how many scans have zero reporters
+  message('number of scans without reporter ion signals = ', nrow(quant_in) - nrow(quant_f1)) #output message
+  quant_meta = quant_in[,c('PrecursorMass','ScanNumber','MS1ScanNumber','RetentionTime',
+                           'PrecursorCharge','MS2IonInjectionTime','MS1Interference')] #extract the quantification meta data
+  quant_exprs = quant_in[,c('iTRAQ113_intensity','iTRAQ114_intensity','iTRAQ115_intensity','iTRAQ116_intensity',
+                            'iTRAQ117_intensity','iTRAQ118_intensity','iTRAQ119_intensity','iTRAQ121_intensity',
+                            'iTRAQ113_noise','iTRAQ114_noise','iTRAQ115_noise','iTRAQ116_noise','iTRAQ117_noise',
+                            'iTRAQ118_noise','iTRAQ119_noise','iTRAQ121_noise')] #extract the quantification data
+  quant_sn = quant_exprs[,c(1:8)] / quant_exprs[,c(9:16)] #calculate the signal to noise
+  quant_sn$totalIntensity = rowSums(quant_exprs[,1:8],na.rm=TRUE) #calculate the total sum intensity
+  quant_sn$totalSN = rowSums(quant_sn[,1:8],na.rm=TRUE) #calculate the total sum signal to noise
+  quant_sn$totalNoise = rowSums(quant_exprs[,9:16],na.rm=TRUE) #calculate the total sum noise
+  quant_sn$totalNA = rowSums(is.na(quant_sn[,1:8])) #grab the number of NA values across the TMT channels
+  quant_meta$fraction = sub(".*?Isolationexp_(.*?)_.*", "\\1", quant_files[i]) #add a fraction column
+  quant_matrix = cbind(quant_meta,quant_sn) #combined the meta and final expression data
+  
+  
+  
+  ####this third section handles the Proteome Discoverer quantification data
+  pd_in = read.table(pd_files[i],header=TRUE,sep='\t') #grab the input file
+  colnames(pd_in) = c('Checked','BestPSMAmbiguity','Analyzer','ActivationType','MSOrder','NumberOfPSMs',
+                      'pd_MS1Interference','pd_MS3IonInjectionTime','pd_PrecursorMass','mono','pd_PrecursorCharge',
+                      'pd_RetentionTime','ScanNumber','fraction','pd_meanSN','pd_113','pd_114','pd_115','pd_116',
+                      'pd_117','pd_118','pd_119','pd_121') #reassign column names
+  pd_in$fraction = sub(".*?Isolationexp_(.*?)_.*", "\\1", pd_in$fraction) #add a fraction column
+
+  
+  ####this section merges all of the data together
+  psm_quant1 = merge(psm_f3,quant_matrix, by=c('ScanNumber','fraction'),all.x=TRUE) #merge the identifications with RawQuant data
+  psm_quant2 = merge(psm_quant1,pd_in,by=c('ScanNumber','fraction'),all.x=TRUE) #merge with Proteome Discoverer data
+  psm_all = rbind(psm_all,psm_quant2) #bind all the data into a continuous single set
+  
+  message('finished ',i,' files') #output message for tracking progress
+}
+#save the output data frame for later use
+saveRDS(psm_all, '/projects/ptx_analysis/chughes/projects-current/raw-quant/published-data/munoz_iTRAQ/Routput/munoz-itraq_all-psms-id-quant.rds')
+```
+
+First we can look at the 'compressed' vs. 'uncompressed' channel values to see if they line up with published data.
+
+```{r}
+id_table = readRDS('/projects/ptx_analysis/chughes/projects-current/raw-quant/published-data/munoz_iTRAQ/Routput/munoz-itraq_all-psms-id-quant.rds')
+#use the 2p0 replicates for this, as that is what was used in the paper, and only ecoli peptides
+id_2p0 = subset(id_table, grepl('2p0', id_table$fraction) & grepl('coli', id_table$species)) #grab the correct PSMs
+#calculate the log2 ratios of the compressed (113/115) and uncompressed (117/119) channels
+id_2p0$compressed = log2(id_2p0$iTRAQ113_intensity / id_2p0$iTRAQ115_intensity) #calculate compressed ratios
+id_2p0$uncompressed = log2(id_2p0$iTRAQ117_intensity / id_2p0$iTRAQ119_intensity) #calculate uncompressed ratios
+#plot the resulting values
+compress_plot = ggplot(melt(id_2p0[,50:51]), aes(variable,value)) +
+  geom_point(aes(fill=variable),position=position_jitterdodge(dodge.width=0.9),colour='grey80',alpha=0.4) +
+  geom_boxplot(aes(fill=variable),fill='white',outlier.colour=NA,position=position_dodge(width=0.9)) +
+  labs(x = "iTRAQ Channels", y = 'log2 ratio', title = 'iTRAQ Ratio Compression') +
+  theme(axis.text.x = element_text(hjust = 1, size = 9)) +
+  scale_y_continuous(limits=c(-0.5,2.5),breaks=seq(-0.5,2.5,0.5)) +
+  theme(legend.position="none") +
+  geom_hline(yintercept = log2(2.5),linetype='dashed',colour=brewer.pal(6,'RdBu')[1])
+compress_plot #call the plot
+save_plot('/projects/ptx_analysis/chughes/projects-current/raw-quant/published-data/munoz_iTRAQ/Routput/munoz_compression_boxplot.pdf',compress_plot) #save the plot
+
+#grab a p-value for the comparison
+compress_test = lm(compressed ~ uncompressed, data = id_2p0) 
+summary(compress_test) #hmm...the linear model doesn't seem to work well here. We can try a simple t-test
+t.test(id_2p0$compressed,id_2p0$uncompressed) #perform the standard t-test
+t.test(id_2p0$compressed, conf.level = 0.95) #get the confidence interval for the compressed data
+t.test(id_2p0$uncompressed, conf.level = 0.95) #get the confidence interval for the uncompressed data
+```
+
+Compare with reported expression values from their paper and Proteome Discoverer.
+
+```{r}
+#grab the published data for one of the 2p0 replicates
+munoz_exprs = read.table('/projects/ptx_results/OtherDataSets/2016-July_Munoz_JPro/expression-tables/QExactive_2p0_rep05.txt',header=TRUE,sep='\t')
+colnames(munoz_exprs)[1] = 'sequence' #change a column name for merging purposes
+munoz_exprs$sequence = toupper(munoz_exprs$sequence) #reshape the peptide data to remove modifications
+id_2p0 = subset(id_table, grepl('2p0_05', id_table$replicate) & grepl('coli', id_table$species)) #grab the RawQuant data
+munoz_id = merge(munoz_exprs, id_2p0, by='sequence') #merge the two sets by their peptide sequences
+quant_matrix = as.matrix(cor(munoz_id[,6:13],munoz_id[,37:44],use='pairwise.complete.obs',method='pearson')) #get correlation
+quant_matrix #call the correlation matrix
+#hmm...this is pretty low...much lower than I would expect.
+
+#what about with our own Proteome Discoverer data
+quant_matrix = as.matrix(cor(id_2p0[,17:24],id_2p0[,42:49],use='pairwise.complete.obs',method='pearson')) #get correlation
+quant_matrix #call the correlation matrix
+#hmm...this is almost perfect
+#wonder why they disagree? Old software vs. new? Seems they did some other transformations in isobar...not really clear exactly what.
+```
+
+Done.
