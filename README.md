@@ -1,4 +1,4 @@
 # RawQuant_JPR-2018
 RawQuant script manuscript
 
-R Notebook files were created using R Studio. The raw Rmd files can be edited and reprocessed directly in RStudio, or any text/markdown editor. The compiled html files can be viewed in any standard web browser, and the embedded code downloaded to your own system.
+R Notebook files were created using R Studio. The easiest way to work with these files is to download them using the green 'Clone or download' button in the top right to grab a ZIP archive of all of the files in the repository. Open the downloaded html files in any web browser.
